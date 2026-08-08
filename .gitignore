@@ -1,0 +1,36 @@
+# Local development
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/
+
+# IDE and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime credentials and Home Assistant data
+auth.json
+authorized_keys
+ssh_host_*_key
+ssh_host_*_key.pub
+secrets.yaml
+.storage/
+home-assistant_v2.db*
+
+# Local test output
+.test-tmp/
+*.log
+
+# Runtime feedback reports (private, never commit)
+/feedback/
+
+# Private development and agent knowledge files (NEVER commit)
+.agent/
+troubleshooting_history.md
+SKILL.md
+changelog.md
+
