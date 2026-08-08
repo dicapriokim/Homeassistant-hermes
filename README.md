@@ -3,14 +3,14 @@
 </p>
 
 <p align="center">
-  <img src="codex_home_assistant/logo.png" alt="Codex for Home Assistant 로고" width="180">
+  <img src="codex_home_assistant/logo.png" alt="Hermes Agent for Home Assistant 로고" width="180">
 </p>
 
-<h1 align="center">Codex for Home Assistant</h1>
+<h1 align="center">Hermes Agent for Home Assistant</h1>
 
 <p align="center">
-  Home Assistant 안에서 Codex와 대화하며 설정을 살펴보고,<br>
-  대시보드·자동화·엔티티·오류를 함께 정리하는 Home Assistant 앱입니다.
+  Google Gemini 3.6 기반으로 Home Assistant 설정을 제어하고,<br>
+  데스크탑·모바일 텔레그램 봇에서 스마트홈 기기 상태 확인 및 YAML 관리를 수행하는 스마트 에이전트입니다.
 </p>
 
 <p align="center">
