@@ -113,23 +113,59 @@ python3 setup.py
 > [!IMPORTANT]
 > **`setup.py` 실행으로 `.env` 환경변수가 최초 생성되거나 수정(API 키/토큰 변경 등)된 직후에는 반드시 아래 구동 명령어를 실행하여 변경된 `.env` 정보를 도커 컨테이너로 새로 로드해야 에이전트에 정상 반영됩니다.**
 
-LXC 터미널에서 아래 한 줄 명령어를 전송하여 에이전트를 구동(또는 재시동)합니다:
+LXC 터미널에서 아래 한 줄 명령어를 전송하여 에이전트를 구동(또는 라이브 마운트 재시동)합니다:
 ```bash
-docker rm -f hermes-agent 2>/dev/null; docker run -d --name hermes-agent --security-opt apparmor=unconfined --env-file .env -p 2223:22 -v /usr/share/hassio/homeassistant:/config hermes-agent:local
+docker rm -f hermes-agent 2>/dev/null; docker run -d --name hermes-agent --security-opt apparmor=unconfined --env-file /opt/Homeassistant-hermes/.env -p 2223:22 -v /usr/share/hassio/homeassistant:/config -v /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/usr/local/bin:/usr/local/bin hermes-agent:local
 ```
 - **동작 검증**: `docker logs --tail 30 -f hermes-agent` 실행 후 텔레그램 봇에게 *"우리집 전체 온도 알 수 있을까"* 전송하여 대답 확인.
 
 ---
 
 ### 2.7 개발 단계 코드 1초 초고속 반영 배포 (pkill 방식)
+
 PC에서 코드를 수정 후 재배포할 때, 도커 재빌드 없이 1초 만에 반영하는 일상 개발용 명령어입니다:
 
-- **PC PowerShell 한 줄 배포 명령어**:
-  ```powershell
-  scp -F NUL -r D:\Antigravity\hermes root@<LXC_HOST_IP>:/opt/Homeassistant-hermes; ssh -F NUL root@<LXC_HOST_IP> "cp -rf /opt/Homeassistant-hermes/hermes/* /opt/Homeassistant-hermes/ 2>/dev/null; rm -rf /opt/Homeassistant-hermes/hermes; chmod -R 0755 /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/usr/local/bin/ /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/etc/s6-overlay/s6-rc.d/; docker start hermes-agent 2>/dev/null || docker run -d --name hermes-agent --security-opt apparmor=unconfined --env-file /opt/Homeassistant-hermes/.env -p 2223:22 -v /usr/share/hassio/homeassistant:/config -v /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/usr/local/bin:/usr/local/bin hermes-agent:local; docker exec hermes-agent pkill -f python3 2>/dev/null || true; docker logs --tail 20 -f hermes-agent"
-  ```
+#### 📌 방법 1: 🎯 핀포인트(Pin-point) 타겟 수정 배포 (강력 추천!)
+수정된 소스 파일만 초고속 전송하여 컨테이너로 직접 주입 및 0.1초 즉시 반영하는 스마트 핀수정 방식입니다:
+```powershell
+scp -F NUL D:\Antigravity\hermes\hermes_home_assistant\rootfs\usr\local\bin\gemini_agent.py D:\Antigravity\hermes\hermes_home_assistant\rootfs\usr\local\bin\telegram_notifier.py root@<LXC_HOST_IP>:/opt/Homeassistant-hermes/hermes_home_assistant/rootfs/usr/local/bin/; ssh -F NUL root@<LXC_HOST_IP> "docker cp /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/usr/local/bin/gemini_agent.py hermes-agent:/usr/local/bin/gemini_agent.py 2>/dev/null; docker cp /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/usr/local/bin/telegram_notifier.py hermes-agent:/usr/local/bin/telegram_notifier.py 2>/dev/null; docker exec hermes-agent pkill -f python3 2>/dev/null || true; docker logs --tail 20 -f hermes-agent"
+```
+
+#### 📌 방법 2: 📦 전체 프로젝트 원스톱 동기화 배포
+전체 소스 폴더를 한 번에 동기화하고 컨테이너 자동 재시동까지 포함하는 안전 통합 방식입니다:
+```powershell
+scp -F NUL -r D:\Antigravity\hermes root@<LXC_HOST_IP>:/opt/Homeassistant-hermes; ssh -F NUL root@<LXC_HOST_IP> "cp -rf /opt/Homeassistant-hermes/hermes/* /opt/Homeassistant-hermes/ 2>/dev/null; rm -rf /opt/Homeassistant-hermes/hermes; chmod -R 0755 /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/usr/local/bin/ /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/etc/s6-overlay/s6-rc.d/; docker start hermes-agent 2>/dev/null || docker run -d --name hermes-agent --security-opt apparmor=unconfined --env-file /opt/Homeassistant-hermes/.env -p 2223:22 -v /usr/share/hassio/homeassistant:/config -v /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/usr/local/bin:/usr/local/bin hermes-agent:local; docker exec hermes-agent pkill -f python3 2>/dev/null || true; docker logs --tail 20 -f hermes-agent"
+```
+
 > [!TIP]
 > 💡 pkill 방식의 0.1초 원격 자동 재시동 원리는 [5.3 pkill 방식의 0.1초 즉시 재시동 원리](#53-pkill-방식의-01초-즉시-재시동-원리)를 참고하세요.
+
+---
+
+### 2.8 📱 텔레그램 봇 모바일 기능 고도화 가이드
+
+텔레그램 봇은 스마트폰 모바일 환경에서 가장 빠르고 간편하게 스마트홈을 관제하도록 최적화되어 있습니다:
+
+1. **⚡ 실시간 상태 지표 (`typing...`)**:
+   - 질문 전송 즉시 텔레그램 상단에 `입력 중... (typing)` 상태가 표시되어 에이전트의 가동 상태를 실시간 확인 가능.
+
+2. **🔘 대화형 원클릭 인라인 버튼 (Inline Keyboard UI)**:
+   - 모든 답변 하단 및 `/start` 실행 시 원클릭 바로가기 버튼 제공:
+     - `[ 🏠 상태 조회 ]` `[ 📜 자동화 목록 ]` `[ ⏪ 백업 롤백 ]` `[ 🧹 대화 초기화 ]`
+
+3. **🎙️ 음성 메시지(Voice Note) 인식 및 기기 제어**:
+   - 텔레그램 음성 메시지(`.ogg`)를 보내면 Gemini 멀티모달 AI가 음성을 분석하여 기기 조작 및 상태 조회를 즉시 수행.
+
+4. **📌 모바일 단축 명령어 모음**:
+   - `/status` : 우리 집 전체 기기 및 온·습도 실시간 요약
+   - `/automations` : 현재 등록된 automations.yaml 확인 및 검토
+   - `/rollback` : 직전 안전 백업본으로 YAML 복원
+   - `/clear` : 대화 기억(Context) 초기화
+   - `/help` : 사용 가이드 및 도움말
+
+5. **🔔 스마트 실시간 이상 감지 알림 엔진 (`telegram_notifier.py`)**:
+   - 환기 중(창문 열림) 에어컨/공기청정기 가동 시 즉시 경고 푸시 전송.
+   - 실내 온·습도 이상(32°C 이상 / 5°C 이하) 및 배터리 잔량 10% 이하 시 자동 알림.
 
 ---
 
@@ -268,6 +304,11 @@ Hermes Agent는 YAML 파일 수정 시 예기치 않은 오작동이나 구문 �
 ### 5.7 한글 자동화 질문 시 영문 엔티티 ID 자동 맵핑 방식
 - **증상**: *"공기청정기 자동화 검토해 줘"* 질문 시 복잡한 영문 엔티티 ID(`automation.geosil_gaseubgi...`)를 물어보는 현상.
 - **해결책**: 백엔드의 2단계 자동 추적 알고리즘이 `get_device_state("")`로 한글 표시 이름(Friendly Name)과 영문 ID를 자동 맵핑한 뒤 `/config/automations.yaml`을 직접 읽어오도록 개선되었습니다.
+
+### 5.8 실시간 소스코드 라이브 볼륨 마운트 구동 원리
+- **증상**: `pkill`을 실행하고 핀포인트 전송을 했는데도 도커 내부에서 옛날 코드만 지속적으로 실행되는 현상.
+- **원인**: 최초 `docker run` 시 `-v /opt/Homeassistant-hermes/hermes_home_assistant/rootfs/usr/local/bin:/usr/local/bin` 실시간 소스코드 볼륨 마운트 옵션이 누락된 채 구동되었을 경우, LXC 호스트 소스 파일만 바뀌고 도커 내부 파이썬 코드는 갱신되지 않습니다.
+- **해결책**: 2.6절의 도커 재구동 명령어(`docker rm -f hermes-agent` 후 라이브 마운트 옵션을 포함하여 `docker run`)를 딱 1회 전송해 두면, 이후부터는 `scp` 전송 ➔ `pkill`만으로 100% 라이브 코드가 0.1초 만에 반영됩니다.
 
 ---
 *(본 설명서는 개발 단계에 따라 지속적으로 업데이트됩니다.)*

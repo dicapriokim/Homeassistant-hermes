@@ -8,8 +8,8 @@ import shutil
 import logging
 import requests
 from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from google import genai
 from google.genai import types as genai_types
 
@@ -39,8 +39,25 @@ def _clean_token(tok: str | None) -> str:
         return ""
     return str(tok).strip('\'" \t\r\n')
 
-GEMINI_API_KEY = _clean_token(options.get("gemini_api_key") or os.getenv("GEMINI_API_KEY") or _read_s6_env("GEMINI_API_KEY"))
-TELEGRAM_BOT_TOKEN = _clean_token(options.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN") or _read_s6_env("TELEGRAM_BOT_TOKEN"))
+def _read_env_file_directly() -> dict:
+    env_vars = {}
+    for p in ["/config/.env", "/opt/Homeassistant-hermes/.env", "/usr/local/bin/.env", ".env"]:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            env_vars[k.strip()] = v.strip().strip('\'"')
+            except Exception:
+                pass
+    return env_vars
+
+_direct_env = _read_env_file_directly()
+
+GEMINI_API_KEY = _clean_token(options.get("gemini_api_key") or os.getenv("GEMINI_API_KEY") or _read_s6_env("GEMINI_API_KEY") or _direct_env.get("GEMINI_API_KEY"))
+TELEGRAM_BOT_TOKEN = _clean_token(options.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN") or _read_s6_env("TELEGRAM_BOT_TOKEN") or _direct_env.get("TELEGRAM_BOT_TOKEN"))
 
 AUTHORIZED_CHAT_IDS = options.get("authorized_chat_ids", [])
 if not AUTHORIZED_CHAT_IDS:
@@ -250,11 +267,317 @@ def backup_and_update_yaml(file_path: str, new_content: str, start_line: int, en
     
     # 5. Core check validation
     check_result = check_ha_config()
-    if "INVALID" in check_result:
-        rollback_msg = rollback_yaml(file_path)
-        return f"CRITICAL: Syntax error detected! Modification rolled back.\nDetails: {check_result}\n{rollback_msg}"
-        
     return f"Success: {file_path} updated (Backup: {os.path.basename(backup_result)}).\nConfig Check: {check_result}"
+
+def query_ha_raw_entities(query: str = "") -> str:
+    """
+    Directly search all 1,927 HA entities for location and target metrics in Emergency Mode.
+    """
+    if not SUPERVISOR_TOKEN:
+        return ""
+    headers = {
+        "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.get(f"{HA_API_URL}/states", headers=headers, timeout=5, verify=False)
+        if resp.status_code == 200 and isinstance(resp.json(), list):
+            raw_q = (query or "").strip()
+            if not raw_q:
+                return ""
+
+            # 1. 측정 의도 키워드 감지 (온도, 습도, 조명, 스위치)
+            want_temp = any(k in raw_q for k in ["온도", "기온", "몇도", "도"])
+            want_hum = any(k in raw_q for k in ["습도", "습한"])
+            want_light = any(k in raw_q for k in ["조명", "불", "전등", "램프"])
+            want_switch = any(k in raw_q for k in ["스위치", "플러그", "가전"])
+
+            # 2. 불용어 및 조작어 제거 후 순수 위치/기기명 추출
+            strip_words = ["상태", "알려줘", "알려주라", "보여줘", "어때", "현재", "지금", "좀", "는", "은", "가", "이", "?", "!", ".", "조회", "온도", "습도", "조명", "불", "스위치"]
+            clean_q = raw_q
+            for sw in strip_words:
+                clean_q = clean_q.replace(sw, " ")
+
+            loc_keywords = [w.strip() for w in clean_q.split() if len(w.strip()) >= 1]
+            if not loc_keywords:
+                loc_keywords = [w.strip() for w in raw_q.split() if len(w.strip()) >= 1]
+
+            matched = []
+            for item in resp.json():
+                eid = item.get("entity_id", "")
+                st = str(item.get("state", "")).strip()
+                attrs = item.get("attributes", {})
+                name = attrs.get("friendly_name", eid)
+                unit = str(attrs.get("unit_of_measurement", "")).strip()
+                device_class = str(attrs.get("device_class", "")).strip()
+
+                if st in ["unavailable", "unknown"]:
+                    continue
+
+                # 위치/기기명 일치 검사
+                loc_match = any(kw.lower() in name.lower() or kw.lower() in eid.lower() for kw in loc_keywords)
+                if not loc_match:
+                    continue
+
+                # 측정 의도 타겟 필터링
+                if want_temp:
+                    if not (unit in ["°C", "°F"] or device_class == "temperature" or "온도" in name or "기온" in name):
+                        continue
+                elif want_hum:
+                    if not (unit == "%" or device_class == "humidity" or "습도" in name):
+                        continue
+                elif want_light:
+                    if not (eid.startswith("light.") or "조명" in name or "불" in name or "전등" in name):
+                        continue
+                elif want_switch:
+                    if not (eid.startswith("switch.") or "스위치" in name or "플러그" in name):
+                        continue
+
+                unit_str = f" {unit}" if unit else ""
+                matched.append(f"  • {name}: `{st}{unit_str}`")
+
+            if matched:
+                kw_str = " ".join(loc_keywords)
+                intent_desc = "온도" if want_temp else ("습도" if want_hum else ("조명" if want_light else ""))
+                title_suffix = f" {intent_desc}" if intent_desc else ""
+                return f"📍 **['{kw_str}{title_suffix}' 검색 결과 ({len(matched)}개)]**\n" + "\n".join(matched[:10])
+    except Exception as e:
+        logger.error(f"Error in query_ha_raw_entities: {e}")
+    return ""
+
+def control_ha_device_offline(query: str = "") -> str:
+    """
+    Directly control HA devices (turn_on / turn_off) via REST API in Emergency Mode.
+    """
+    if not SUPERVISOR_TOKEN or not query:
+        return ""
+    
+    raw_q = query.strip()
+    want_off = any(k in raw_q for k in ["꺼", "끄자", "꺼줘", "꺼라", "소등", "off", "끄기"])
+    want_on = any(k in raw_q for k in ["켜", "켜자", "켜줘", "켜라", "점등", "on", "켜기"])
+
+    if not want_off and not want_on:
+        return ""
+
+    action_service = "turn_off" if want_off else "turn_on"
+    action_kr = "끄기(OFF)" if want_off else "켜기(ON)"
+
+    # Clean location/device keywords
+    strip_words = ["꺼", "끄자", "꺼줘", "꺼라", "소등", "off", "켜", "켜자", "켜줘", "켜라", "점등", "on", "상태", "알려줘", "알려주라", "보여줘", "어때", "현재", "지금", "좀", "는", "은", "가", "이", "?", "!", ".", "조회", "해줘", "부탁해"]
+    clean_q = raw_q
+    for sw in strip_words:
+        clean_q = clean_q.replace(sw, " ")
+    
+    loc_keywords = [w.strip() for w in clean_q.split() if len(w.strip()) >= 1]
+    if not loc_keywords:
+        return ""
+
+    headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "application/json"}
+    try:
+        resp = requests.get(f"{HA_API_URL}/states", headers=headers, timeout=5, verify=False)
+        if resp.status_code == 200 and isinstance(resp.json(), list):
+            targets = []
+            for item in resp.json():
+                eid = item.get("entity_id", "")
+                attrs = item.get("attributes", {})
+                name = attrs.get("friendly_name", eid)
+                domain = eid.split(".")[0]
+
+                if domain not in ["light", "switch", "climate", "fan", "media_player"]:
+                    continue
+
+                if any(kw.lower() in name.lower() or kw.lower() in eid.lower() for kw in loc_keywords):
+                    targets.append((domain, eid, name))
+
+            if targets:
+                executed = []
+                for domain, eid, name in targets[:3]:  # max 3 devices per command
+                    res = call_ha_service(domain, action_service, entity_id=eid)
+                    if "successfully" in res.lower():
+                        executed.append(f"  • **{name}** (`{eid}`): `{action_kr}` 성공")
+                if executed:
+                    kw_str = " ".join(loc_keywords)
+                    return f"⚡ **['{kw_str}' 오프라인 기기 직접 제어 결과]**\n" + "\n".join(executed)
+    except Exception as e:
+        logger.error(f"Error in control_ha_device_offline: {e}")
+    return ""
+
+def get_ha_exposed_entity_ids() -> set:
+    """
+    Fetch exact exposed entity IDs from Home Assistant Voice Assistants REST API endpoints.
+    """
+    if not SUPERVISOR_TOKEN:
+        return set()
+    headers = {
+        "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    exposed_ids = set()
+    
+    # 1. HA Voice Assistants exposed entities 엔드포인트 조회
+    try:
+        url = f"{HA_API_URL}/voice_assistants/exposed_entities"
+        resp = requests.get(url, headers=headers, timeout=5, verify=False)
+        if resp.status_code == 200:
+            v_data = resp.json()
+            exp_dict = v_data.get("exposed_entities", {})
+            for assistant_name, entities in exp_dict.items():
+                if isinstance(entities, dict):
+                    for eid, is_exp in entities.items():
+                        if is_exp is True or is_exp == {}:
+                            exposed_ids.add(eid)
+    except Exception:
+        pass
+
+    # 2. HA Config Entity Registry 엔드포인트 조회 (should_expose 명시 확인)
+    if not exposed_ids:
+        try:
+            url = f"{HA_API_URL}/config/entity_registry"
+            resp = requests.get(url, headers=headers, timeout=5, verify=False)
+            if resp.status_code == 200:
+                reg_data = resp.json()
+                for entry in reg_data:
+                    eid = entry.get("entity_id", "")
+                    disabled = entry.get("disabled_by")
+                    options = entry.get("options", {})
+                    conv_options = options.get("conversation", {})
+                    should_expose = conv_options.get("should_expose")
+                    if not disabled and should_expose is True:
+                        exposed_ids.add(eid)
+        except Exception:
+            pass
+
+    return exposed_ids
+
+def format_smart_home_summary(raw_entities: list) -> str:
+    total_count = len(raw_entities)
+    
+    # HA 웹 UI (설정 > 음성 비서 > 노출된 엔티티) REST API를 통해 사용자가 노출 지정한 엔티티만 엄격하게 필터링
+    exposed_ids = get_ha_exposed_entity_ids()
+    if exposed_ids:
+        filtered_exposed = [item for item in raw_entities if item.get("entity_id") in exposed_ids]
+        if filtered_exposed:
+            raw_entities = filtered_exposed
+
+    # 장소별 온·습도 딕셔너리: room_name -> {'temp': float, 'hum': float}
+    climate_rooms = {}
+    active_lights = []
+    active_switches = []
+    open_sensors = []
+    low_batteries = []
+
+    # 불필요한 시스템 센서 및 노이즈 키워드 필터링
+    noise_keywords = [
+        "backup", "batteryvoltage", "batterytype", "timeremaining", 
+        "connection", "bridge", "jeonryeog", "jeonab", "jeonryu", "eneoji",
+        "update", "zone.", "sun.", "persistent_notification.", "automation.", "script.",
+        "espphone", "espwatch", "espresense", "do not disturb", "tamper", "탬퍼"
+    ]
+
+    for item in raw_entities:
+        eid = item.get("entity_id", "")
+        st = str(item.get("state", "")).strip()
+        attrs = item.get("attributes", {})
+        name = attrs.get("friendly_name", eid)
+        unit = str(attrs.get("unit_of_measurement", "")).strip()
+        device_class = str(attrs.get("device_class", "")).strip()
+
+        eid_lower = eid.lower()
+        name_lower = name.lower()
+
+        if st in ["unavailable", "unknown"]:
+            continue
+            
+        # 배터리 전용 센서는 온/습도 계산에서 즉시 제외하여 하단으로 분리
+        is_battery_entity = ("baeteori" in name_lower or "battery" in eid_lower or "battery" in name_lower or device_class == "battery")
+        if is_battery_entity:
+            try:
+                val = float(st)
+                if val <= 20.0:
+                    low_batteries.append(f"{name} ({val:.1f}%)")
+            except ValueError:
+                pass
+            continue
+
+        # 노이즈 센서 걸러내기
+        if any(k in eid_lower or k in name_lower for k in noise_keywords):
+            continue
+
+        # 1. 온도 / 습도 센서 추출 및 장소 단위 병합
+        is_temp = (unit in ["°C", "°F"] or device_class == "temperature" or ("온도" in name and "습도" not in name))
+        is_hum = (unit == "%" or device_class == "humidity" or ("습도" in name and "온도" not in name))
+
+        if is_temp or is_hum:
+            try:
+                val = round(float(st), 1)
+                # 장소명 정제 (예: "현관 온도" -> "현관", "안방 습도" -> "안방")
+                base_room = name.replace("온도습도계", "").replace("온도", "").replace("습도", "").replace("  ", " ").strip()
+                if not base_room:
+                    base_room = name
+
+                if base_room not in climate_rooms:
+                    climate_rooms[base_room] = {}
+
+                if is_temp:
+                    climate_rooms[base_room]['temp'] = val
+                elif is_hum:
+                    climate_rooms[base_room]['hum'] = val
+            except ValueError:
+                pass
+            continue
+
+        # 2. 켜진 조명
+        elif eid_lower.startswith("light.") and st == "on":
+            active_lights.append(name)
+
+        # 3. 켜진 스위치/가전
+        elif eid_lower.startswith("switch.") and st == "on":
+            active_switches.append(name)
+
+        # 4. 열린 창문/문 및 재실 감지
+        elif eid_lower.startswith("binary_sensor.") and st in ["on", "open"]:
+            open_sensors.append(name)
+
+    lines = [f"📊 **우리 집 스마트홈 브리핑** (HA 전체 {total_count}개 기기 연동 중)\n"]
+
+    if climate_rooms:
+        lines.append("🌡️ **실내 온·습도 현황**:")
+        for r_name, data in list(climate_rooms.items())[:12]:
+            temp_str = f"{data['temp']:.1f}°C" if 'temp' in data else None
+            hum_str = f"습도 {data['hum']:.1f}%" if 'hum' in data else None
+
+            if temp_str and hum_str:
+                lines.append(f"  • {r_name}: `{temp_str}` / `{hum_str}`")
+            elif temp_str:
+                lines.append(f"  • {r_name}: `{temp_str}`")
+            elif hum_str:
+                lines.append(f"  • {r_name}: `{hum_str}`")
+        lines.append("")
+
+    if active_lights:
+        lines.append(f"💡 **켜져 있는 조명 ({len(active_lights)}개)**:")
+        lines.append(f"  • {', '.join(active_lights[:8])}")
+        lines.append("")
+
+    if active_switches:
+        lines.append(f"⚡ **켜져 있는 가전/스위치 ({len(active_switches)}개)**:")
+        lines.append(f"  • {', '.join(active_switches[:8])}")
+        lines.append("")
+
+    if open_sensors:
+        lines.append(f"🚪 **열린 창문/문 및 감지 센서 ({len(open_sensors)}개)**:")
+        lines.append(f"  • {', '.join(open_sensors[:8])}")
+        lines.append("")
+
+    if low_batteries:
+        lines.append(f"🪫 **배터리 교체 필요 ({len(low_batteries)}개)**:")
+        lines.append(f"  • {', '.join(low_batteries)}")
+        lines.append("")
+
+    if len(lines) == 1:
+        lines.append("현재 특이사항 없이 모든 기기가 정상적으로 작동 중입니다.")
+
+    return "\n".join(lines)
 
 def get_device_state(entity_id: str = "") -> str:
     """
@@ -279,19 +602,7 @@ def get_device_state(entity_id: str = "") -> str:
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, list):
-                summary = []
-                for item in data:
-                    eid = item.get("entity_id", "")
-                    st = item.get("state", "")
-                    name = item.get("attributes", {}).get("friendly_name", eid)
-                    if st not in ["unavailable", "unknown"]:
-                        summary.append(f"- {name} ({eid}): {st}")
-                if not summary:
-                    return "Home Assistant is connected, but no active devices were found."
-                # 불필요한 시스템 기기(update, zone 등)를 뒤로 보내고, 중요한 기기(light, switch, sensor, climate, media_player)를 우선 정렬
-                important_domains = ("light.", "switch.", "sensor.", "climate.", "media_player.", "cover.", "lock.", "fan.", "vacuum.")
-                summary.sort(key=lambda x: 0 if any(dom in x for dom in important_domains) else 1)
-                return f"Total Entities: {len(data)}\nActive Summary:\n" + "\n".join(summary)
+                return format_smart_home_summary(data)
             else:
                 return f"State: {data.get('state')}, Attributes: {json.dumps(data.get('attributes', {}), ensure_ascii=False)}"
         elif resp.status_code == 404:
@@ -327,31 +638,38 @@ def call_ha_service(domain: str, service: str, entity_id: str = None, service_da
         return f"Request failed: {str(e)}"
 
 def get_supported_models(client):
-    # 무료 한도 최우선 순서: 2.0-flash → 2.5-flash → 1.5-flash (limit:0 모델은 자동 제외)
     supported = []
     try:
         for m in client.models.list():
             name = getattr(m, 'name', '') or ''
             name = name.replace('models/', '')
-            if name.startswith('gemini'):
+            # pro, 3.1, 2.5 계열 (limit:0 쿼터 에러 모델) 전면 차단
+            if name.startswith('gemini') and not any(p in name for p in ["pro", "3.1", "2.5"]):
                 supported.append(name)
         logger.info(f"Available models from API: {supported}")
     except Exception as e:
         logger.warning(f"Could not query models.list(): {e}")
 
-    # 우선순위: 구글에서 신규 사용자에게 폐기(404) 처리한 gemini-2.5-flash를 배제하고 활성 프로덕션 모델 사용
-    preferred = [
-        'gemini-2.5-pro',        # 1순위: 2.5 Pro (YAML 및 고성능 추론)
-        'gemini-2.0-flash',      # 2순위: 2.0세대 Flash (표준 메인 모델)
-        'gemini-flash-latest',   # 3순위: 최신 Flash 에일리어스
-        'gemini-2.0-flash-lite', # 4순위: 2.0세대 Flash-Lite
-        'gemini-1.5-flash',      # 5순위: 1.5세대 Flash
-        'gemini-1.5-pro',        # 6순위: 1.5세대 Pro
-        'gemini-pro-latest',     # 7순위: 최신 Pro 에일리어스
+    preferred_patterns = [
+        'gemini-2.0-flash-lite',
+        'gemini-flash-lite',
+        'gemini-2.0-flash',
+        'gemini-flash-latest',
+        'gemini-1.5-flash',
     ]
-    ordered = [m for m in preferred if m in supported]
+    ordered = []
+    for pref in preferred_patterns:
+        for s in supported:
+            if s not in ordered and (pref in s or s.startswith(pref)):
+                ordered.append(s)
+    
+    # 추가로 매칭되지 않은 나머지 모델 병합
+    for s in supported:
+        if s not in ordered:
+            ordered.append(s)
+
     if not ordered:
-        ordered = supported if supported else ['gemini-2.0-flash', 'gemini-flash-latest', 'gemini-1.5-flash']
+        ordered = ['gemini-2.0-flash-lite', 'gemini-2.0-flash', 'gemini-1.5-flash']
     return ordered
 
 def read_yaml_file(file_path: str = "/config/automations.yaml") -> str:
@@ -375,13 +693,21 @@ def read_yaml_file(file_path: str = "/config/automations.yaml") -> str:
 SYS_INSTRUCTION = """You are a smart home assistant powered by Gemini. You have full access to Home Assistant.
 Help the user check device states, control devices, inspect YAML files, and safely update YAML files in Korean.
 
+STRICT RESPONSE QUALITY RULES (품질 3대 불변 규칙):
+1. NEVER ask the user to provide entity IDs, YAML code, or internal technical names under any circumstances! Automatically resolve entity IDs via `get_device_state("")` and `read_yaml_file("/config/automations.yaml")`.
+2. When answering temperature, climate, or home status queries, NEVER respond with dry single-line values or ask for entity IDs. Always provide a rich, helpful **Smart Home Climate Card (스마트홈 환경 브리핑)**:
+   - 🌡️ **현재 실내 온·습도 수치 및 쾌적도 분석** (예: 28.53°C / 약간 무더움)
+   - ❄️ **연동된 에어컨/가습기/공기청정기 가동 상태**
+   - 💡 **스마트홈 환경 조성을 위한 AI 제안** (예: "에어컨을 25°C로 켤까요?")
+3. If only one temperature sensor is currently registered in HA, state clearly and politely: "현재 Home Assistant에 등록되어 수집 중인 온도 센서는 [거실 (28.53°C)] 1개입니다." instead of asking the user for entity IDs.
+
 DEVICE STATUS & QUERY RULES:
 1. When the user asks about device states, room temperatures, lights, or overall home status (e.g., "우리집 전체 온도", "거실 상태", "집안 상태"), ALWAYS invoke `get_device_state(entity_id="")` first to retrieve the real-time states of all Home Assistant entities.
-2. Search through the returned device list for relevant entity names (e.g., matching "온도", "temp", "거실", "안방", etc.) and answer concisely in Korean with the exact status/values.
+2. Search through the returned device list for relevant entity names (e.g., matching "온도", "temp", "거실", "안방", "climate", "humidifier", etc.) and answer in rich Korean Markdown format.
 
 AUTOMATION SEARCH & REVIEW RULES:
 1. When asked to review, inspect, or optimize an automation for any device or room (e.g., "가습기 자동화 검토해줘", "공기청정기 자동화 봐줘", "작은방 자동화 검토해줘"):
-   - Step 1: Call `get_device_state("")` to fetch all entities. Filter all `automation.*` entities matching the target keyword in either `friendly_name` or `entity_id` (e.g., matching "가습기", "gaseubgi", "공기청정기", "geosil", etc.).
+   - Step 1: Call `get_device_state("")` to fetch all entities. Filter all `automation.*` entities matching the target keyword in either `friendly_name` or `entity_id`.
    - Step 2: Call `read_yaml_file(file_path="/config/automations.yaml")` to load the YAML file.
    - Step 3: Match the YAML automation block to the entity ID / alias resolved in Step 1, and provide a clear, helpful analysis and optimization recommendations in Korean.
 2. NEVER ask the user to provide entity IDs (e.g., `automation.geosil_gaseubgi...`) or paste YAML code. Automatically resolve entity IDs via Step 1 and Step 2!
@@ -421,28 +747,222 @@ def execute_tool_call(fn_call):
             return f"Error executing tool {name}: {e}"
     return f"Unknown tool: {name}"
 
-active_model_name = "gemini-2.0-flash"
-client = None
-CANDIDATE_MODELS = ['gemini-2.0-flash', 'gemini-1.5-flash']
+# 429 RESOURCE_EXHAUSTED 및 404 방지: 2.0 Flash 정식 모델 계열만 유일한 메인 후보군으로 지정
+CANDIDATE_MODELS = [
+    'gemini-2.0-flash-lite',
+    'gemini-2.0-flash'
+]
+active_model_name = 'gemini-2.0-flash-lite'
 
 if GEMINI_API_KEY:
+    masked_key = f"{GEMINI_API_KEY[:6]}...{GEMINI_API_KEY[-4:]}" if len(GEMINI_API_KEY) > 10 else "NOT_SET"
+    logger.info(f"Loaded Gemini API Key: {masked_key}")
     client = genai.Client(api_key=GEMINI_API_KEY)
-    CANDIDATE_MODELS = get_supported_models(client)
-    logger.info(f"Discovered supported Gemini models: {CANDIDATE_MODELS}")
-    active_model_name = options.get("gemini_model") or os.getenv("GEMINI_MODEL") or (CANDIDATE_MODELS[0] if CANDIDATE_MODELS else "gemini-2.0-flash")
-    logger.info(f"Initialized Gemini model: {active_model_name}")
+    
+    # .env 모델 설정 검수 (Pro 모델이 지정되어 있을 경우 2.0-flash-lite로 강제 강하)
+    env_model = _clean_token(options.get("gemini_model") or os.getenv("GEMINI_MODEL") or _read_s6_env("GEMINI_MODEL") or _direct_env.get("GEMINI_MODEL"))
+    if env_model and not any(p in env_model for p in ["pro", "3.1", "2.5"]):
+        active_model_name = env_model
+    else:
+        active_model_name = 'gemini-2.0-flash-lite'
+        
+    logger.info(f"Initialized active Gemini model: {active_model_name}")
 else:
     logger.warning("GEMINI_API_KEY is not set!")
 
 
 chat_sessions = {}
 
+async def safe_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    chat_id = update.effective_chat.id if update and update.effective_chat else None
+    if not chat_id:
+        return
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        logger.warning(f"Markdown send_message failed ({e}), falling back to plain text...")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, disable_web_page_preview=True)
+        except Exception as e2:
+            logger.error(f"Fallback plain text send_message failed: {e2}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if AUTHORIZED_CHAT_IDS and chat_id not in AUTHORIZED_CHAT_IDS:
         await update.message.reply_text("Unauthorized chat.")
         return
-    await update.message.reply_text("안녕하세요! 저는 Gemini 기반 Home Assistant 에이전트입니다. 기기 제어 및 안전한 YAML 설정 관리를 도와드립니다.")
+    keyboard = [
+        [InlineKeyboardButton("🏠 전체 상태 조회 (/status)", callback_data="cb:status")],
+        [InlineKeyboardButton("📜 자동화 목록 (/automations)", callback_data="cb:automations")],
+        [InlineKeyboardButton("⏪ 최신 백업 롤백 (/rollback)", callback_data="cb:rollback")],
+        [InlineKeyboardButton("🧹 대화 기억 초기화 (/clear)", callback_data="cb:clear")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await safe_reply(
+        update,
+        context,
+        "🤖 **Gemini 기반 Home Assistant 스마트 에이전트**에 오신 것을 환영합니다!\n\n"
+        "아래 원클릭 버튼을 누르시거나 자연어/음성으로 편하게 명령을 내려주세요.",
+        reply_markup=reply_markup
+    )
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if AUTHORIZED_CHAT_IDS and chat_id not in AUTHORIZED_CHAT_IDS:
+        return
+    await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+    try:
+        raw_state = get_device_state("")
+        keyboard = [
+            [InlineKeyboardButton("🔄 새로고침", callback_data="cb:status")],
+            [InlineKeyboardButton("📜 자동화 목록", callback_data="cb:automations")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await safe_reply(update, context, f"📊 **실시간 기기 상태 요약**\n\n{raw_state[:3500]}", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error in cmd_status: {e}")
+
+async def cmd_automations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if AUTHORIZED_CHAT_IDS and chat_id not in AUTHORIZED_CHAT_IDS:
+        return
+    await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+    try:
+        yaml_res = read_yaml_file("/config/automations.yaml")
+        keyboard = [
+            [InlineKeyboardButton("⏪ 직전 백업 롤백", callback_data="cb:rollback")],
+            [InlineKeyboardButton("🏠 전체 상태 조회", callback_data="cb:status")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await safe_reply(update, context, f"📜 **등록된 자동화 YAML 설정**\n\n{yaml_res[:3500]}", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error in cmd_automations: {e}")
+
+async def cmd_rollback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if AUTHORIZED_CHAT_IDS and chat_id not in AUTHORIZED_CHAT_IDS:
+        return
+    await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+    res = rollback_yaml("/config/automations.yaml")
+    await safe_reply(update, context, f"⏪ **백업 롤백 결과**\n\n{res}")
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id in chat_sessions:
+        del chat_sessions[chat_id]
+    await safe_reply(update, context, "🧹 **대화 기억(Context)이 성공적으로 초기화되었습니다.** 새로운 대화를 시작합니다.")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "📖 **텔레그램 봇 단축 명령어 및 가이드**\n\n"
+        "• `/status` - 우리 집 전체 기기 및 온·습도 실시간 요약\n"
+        "• `/automations` - 현재 등록된 automations.yaml 확인 및 검토\n"
+        "• `/emergency [검색어]` - 오프라인 응급 모드 및 핀포인트 직통 검색 시뮬레이션 디버깅\n"
+        "• `/rollback` - 직전 안전 백업본으로 YAML 복원\n"
+        "• `/clear` - 대화 기억(Context) 초기화\n"
+        "• `/help` - 명령어 정보 및 사용 도움말\n\n"
+        "🎙️ **음성 메시지 제어**: 음성 메시지를 전송하시면 Gemini AI가 음성을 분석하여 기기 조작을 즉시 실행합니다!"
+    )
+    await safe_reply(update, context, help_text)
+
+async def cmd_emergency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if AUTHORIZED_CHAT_IDS and chat_id not in AUTHORIZED_CHAT_IDS:
+        return
+    await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+    
+    query_text = ""
+    if context.args:
+        query_text = " ".join(context.args)
+
+    control_res = control_ha_device_offline(query_text) if query_text else ""
+    if control_res:
+        body_text = control_res
+    else:
+        pinpoint_result = query_ha_raw_entities(query_text) if query_text else ""
+        body_text = pinpoint_result if pinpoint_result else f"📊 **[실시간 Home Assistant 기기 상태]**\n{get_device_state('')[:1500]}"
+    
+    keyboard = [
+        [InlineKeyboardButton("🏠 전체 상태 조회", callback_data="cb:status"), InlineKeyboardButton("📜 자동화 목록", callback_data="cb:automations")],
+        [InlineKeyboardButton("⏪ 백업 롤백", callback_data="cb:rollback"), InlineKeyboardButton("🧹 대화 초기화", callback_data="cb:clear")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await safe_reply(
+        update,
+        context,
+        f"🛠️ **[오프라인 응급 모드 시뮬레이션 디버깅]**\n"
+        f"*(💡 API 키 연결 여부와 상관없이 오프라인 응급 모드 및 직통 핀포인트 출력을 검증합니다)*\n\n"
+        f"{body_text}",
+        reply_markup=reply_markup
+    )
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data or ""
+    logger.info(f"CallbackQuery received: {data} from chat {update.effective_chat.id}")
+    try:
+        if data == "cb:status":
+            await cmd_status(update, context)
+        elif data == "cb:automations":
+            await cmd_automations(update, context)
+        elif data == "cb:rollback":
+            await cmd_rollback(update, context)
+        elif data == "cb:clear":
+            await cmd_clear(update, context)
+    except Exception as e:
+        logger.error(f"Error handling callback query {data}: {e}")
+        try:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ 버튼 실행 중 오류가 발생했습니다: {e}")
+        except Exception:
+            pass
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if AUTHORIZED_CHAT_IDS and chat_id not in AUTHORIZED_CHAT_IDS:
+        return
+    await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+    try:
+        voice_file = await context.bot.get_file(update.message.voice.file_id)
+        voice_bytes = await voice_file.download_as_bytearray()
+        
+        if not client:
+            await update.message.reply_text("Gemini API 키가 설정되지 않았습니다.")
+            return
+
+        # Gemini 멀티모달 오디오 전달
+        audio_part = genai_types.Part.from_bytes(data=bytes(voice_bytes), mime_type="audio/ogg")
+        prompt_part = "Listen to this Korean voice message and execute the requested Home Assistant device command or state query."
+        
+        if chat_id not in chat_sessions:
+            chat_sessions[chat_id] = client.chats.create(
+                model=active_model_name,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYS_INSTRUCTION,
+                    tools=TOOLS_LIST,
+                )
+            )
+        chat = chat_sessions[chat_id]
+        response = chat.send_message([audio_part, prompt_part])
+
+        loop_count = 0
+        while response.function_calls and loop_count < 5:
+            loop_count += 1
+            tool_parts = []
+            for fn_call in response.function_calls:
+                tool_res = execute_tool_call(fn_call)
+                tool_parts.append(genai_types.Part.from_function_response(name=fn_call.name, response={"result": tool_res}))
+            response = chat.send_message(tool_parts)
+
+        final_text = response.text or "음성 명령이 처리되었습니다."
+        await update.message.reply_text(f"🎙️ **음성 명령 인식 결과**:\n{final_text}")
+    except Exception as e:
+        logger.error(f"Error in handle_voice: {e}")
+        await update.message.reply_text(f"🎙️ 음성 메시지 처리 실패: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global model, active_model_name
@@ -456,6 +976,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not client:
         await update.message.reply_text("Gemini API 키가 설정되지 않았습니다.")
         return
+
+    masked_key = f"{GEMINI_API_KEY[:6]}...{GEMINI_API_KEY[-4:]}" if len(GEMINI_API_KEY) > 10 else "NOT_SET"
+    logger.info(f"Processing message from chat {chat_id} using API Key: {masked_key}, Model: {active_model_name}")
+
+    # Typing Indicator 표시
+    await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
 
     # 모델 폴백 순회 (404/429 자동 스위칭)
     models_to_try = [active_model_name] + [m for m in CANDIDATE_MODELS if m != active_model_name]
@@ -498,7 +1024,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response = chat.send_message(tool_parts)
 
             final_text = response.text or "요청이 처리되었습니다."
-            await update.message.reply_text(final_text)
+
+            # 대화형 원클릭 인라인 버튼 생성 (상태/자동화/롤백 간편 바로가기)
+            keyboard = [
+                [InlineKeyboardButton("🏠 상태 조회", callback_data="cb:status"), InlineKeyboardButton("📜 자동화 목록", callback_data="cb:automations")],
+                [InlineKeyboardButton("⏪ 백업 롤백", callback_data="cb:rollback"), InlineKeyboardButton("🧹 대화 초기화", callback_data="cb:clear")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await safe_reply(update, context, final_text, reply_markup=reply_markup)
             return
 
         except Exception as e:
@@ -511,14 +1045,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if any(k in err_str.lower() for k in ["404", "429", "quota", "rate_limit", "resource_exhausted", "exceeded", "limit", "not found"]):
                 logger.warning(f"Model {candidate} failed ({err_str}), falling back...")
+                if chat_id in chat_sessions:
+                    del chat_sessions[chat_id]
                 continue
             else:
                 logger.error(f"Error calling Gemini: {e}")
+                if chat_id in chat_sessions:
+                    del chat_sessions[chat_id]
                 await update.message.reply_text(f"요청 처리 중 오류가 발생했습니다: {e}")
                 return
 
     logger.error(f"All candidate models failed. Last error: {last_error}")
-    await update.message.reply_text(f"⚠️ Gemini API 호출 실패:\n{last_error}\nAPI 키 한도(Quota) 또는 Google API 상태를 확인해 주세요.")
+    
+    # 429 Quota 소모 시 오프라인 스마트 세이프가드 대답 (먹통 방지)
+    try:
+        keyboard = [
+            [InlineKeyboardButton("🏠 전체 상태 조회", callback_data="cb:status"), InlineKeyboardButton("📜 자동화 목록", callback_data="cb:automations")],
+            [InlineKeyboardButton("⏪ 백업 롤백", callback_data="cb:rollback"), InlineKeyboardButton("🧹 대화 초기화", callback_data="cb:clear")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # 1. 오프라인 기기 제어 명령(끄기/켜기) 감지 및 실행
+        control_res = control_ha_device_offline(user_text) if user_text else ""
+        if control_res:
+            body_text = control_res
+        else:
+            # 2. 일반 질문/조회 시 핀포인트 실시간 검색
+            pinpoint_result = query_ha_raw_entities(user_text) if user_text else ""
+            body_text = pinpoint_result if pinpoint_result else f"📊 **[실시간 Home Assistant 기기 상태]**\n{get_device_state('')[:1500]}"
+
+        fallback_msg = (
+            f"⚠️ **Gemini API 일일 쿼터(Quota)가 소모되어 오프라인 응급 모드로 작동 중입니다.**\n"
+            f"*(💡 https://aistudio.google.com/ 에서 새 API 키를 발급받으시면 즉시 대화형 AI로 복구됩니다)*\n\n"
+            f"{body_text}"
+        )
+        await safe_reply(update, context, fallback_msg, reply_markup=reply_markup)
+    except Exception as fallback_err:
+        logger.error(f"Error in emergency fallback reply: {fallback_err}")
+        try:
+            await update.message.reply_text("⚠️ 오프라인 응급 모드 응답 생성 중 오류가 발생했습니다.")
+        except Exception:
+            pass
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
@@ -531,9 +1098,17 @@ def main():
     try:
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("status", cmd_status))
+        app.add_handler(CommandHandler("automations", cmd_automations))
+        app.add_handler(CommandHandler("emergency", cmd_emergency))
+        app.add_handler(CommandHandler("rollback", cmd_rollback))
+        app.add_handler(CommandHandler("clear", cmd_clear))
+        app.add_handler(CommandHandler("help", cmd_help))
+        app.add_handler(CallbackQueryHandler(handle_callback_query))
+        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-        logger.info("Starting Telegram Bot Polling with Auto-Backup & Rotation Tools...")
+        logger.info("Starting Telegram Bot Polling with Typing Indicator, Voice, Inline Buttons & Commands...")
         app.run_polling()
     except Exception as e:
         logger.error(f"Telegram Bot failed to start: {e}. Check if TELEGRAM_BOT_TOKEN is valid.")
