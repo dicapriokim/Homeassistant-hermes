@@ -1,0 +1,38 @@
+#!/usr/bin/env bashio
+
+bashio::log.info "Starting Gemini Agent daemon..."
+
+# Import container environment variables created by s6-overlay from docker run -e / --env-file
+for env_dir in /run/s6/container_environment /var/run/s6/container_environment; do
+    if [[ -d "${env_dir}" ]]; then
+        for varfile in "${env_dir}"/*; do
+            if [[ -f "${varfile}" ]]; then
+                varname=$(basename "${varfile}")
+                varval=$(cat "${varfile}")
+                export "${varname}"="${varval}"
+            fi
+        done
+    fi
+done
+
+if [[ -f /data/options.json ]] && jq -e '.gemini_api_key // empty' /data/options.json >/dev/null 2>&1; then
+    val=$(bashio::config 'gemini_api_key' 2>/dev/null || true)
+    if [[ -n "${val}" ]]; then
+        export GEMINI_API_KEY="${val}"
+    fi
+fi
+
+if [[ -f /data/options.json ]] && jq -e '.telegram_bot_token // empty' /data/options.json >/dev/null 2>&1; then
+    val=$(bashio::config 'telegram_bot_token' 2>/dev/null || true)
+    if [[ -n "${val}" ]]; then
+        export TELEGRAM_BOT_TOKEN="${val}"
+    fi
+fi
+
+export GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+export SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
+export HASS_URL="${HASS_URL:-}"
+export AUTHORIZED_CHAT_IDS="${AUTHORIZED_CHAT_IDS:-}"
+
+exec python3 /usr/local/bin/gemini_agent.py

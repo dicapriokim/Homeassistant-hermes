@@ -1,0 +1,61 @@
+---
+name: Gemini Agent for Home Assistant
+version: "0.6.0"
+slug: gemini_ha_agent
+description: Gemini 3.6 API powered AI agent with Telegram bot and Hermes integration
+url: https://github.com/dicapriokim/Homeassistant-hermes
+stage: experimental
+boot: auto
+init: false
+arch:
+  - amd64
+image: ghcr.io/dicapriokim/hermes-agent
+
+ingress: true
+ingress_port: 7681
+ingress_stream: true
+panel_icon: mdi:robot-outline
+panel_title: Gemini Agent
+
+ports:
+  22/tcp: 2223
+ports_description:
+  22/tcp: SSH for Hermes Desktop
+
+map:
+  - type: homeassistant_config
+    path: /config
+    read_only: false
+
+homeassistant_api: true
+hassio_api: true
+hassio_role: manager
+
+options:
+  gemini_api_key: ""
+  telegram_bot_token: ""
+  authorized_chat_ids: []
+  authorized_keys: []
+  log_level: info
+  web_terminal_auto_start_hermes: false
+  hermes_approval_policy: "on-request"
+  hermes_sandbox_mode: "danger-full-access"
+  browser_approval_policy: "safe"
+  home_assistant_browser_auto_auth: true
+  hermes_user_files_update_mode: "preserve"
+
+schema:
+  gemini_api_key: password
+  telegram_bot_token: password
+  authorized_chat_ids:
+    - int
+  authorized_keys:
+    - str
+  log_level: "list(trace|debug|info|notice|warning|error|fatal)"
+  web_terminal_auto_start_hermes: bool
+  hermes_approval_policy: "list(untrusted|on-request|never)"
+  hermes_sandbox_mode: "list(workspace-write|danger-full-access)"
+  browser_approval_policy: "list(safe|never|always)"
+  home_assistant_browser_auto_auth: bool
+  home_assistant_browser_token: password?
+  hermes_user_files_update_mode: "list(preserve|refresh_agents|refresh_all)"

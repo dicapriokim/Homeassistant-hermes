@@ -20,8 +20,12 @@
 
 ## 🌟 주요 특징 (Features)
 
-| 환경 | 주요 역할 | 핵심 기능 및 UX |
+| 기능 | 주요 역할 | 핵심 기능 및 UX |
 | :---: | :--- | :--- |
+| **최신 GenAI SDK** | Google `google-genai` v1.x 전면 이관 | 최신 Gemini 2.5 Flash / Pro 모델 연동 및 안정적인 `GenerateContentConfig` 사양 준수 |
+| **7단계 자동 폴백** | API 쿼터 초과(429) 및 오류 방지 | 429 / 503 에러 발생 시 Primary -> Secondary -> Tertiary 등 7단계 모델 자동 스위칭 |
+| **무제한 엔티티 수집** | Smart Home 전체 기기 상태 모니터링 | `get_device_state` 개수 제한 제거로 Home Assistant 전체 상태의 실시간 조회 및 인덱싱 |
+| **도구 자동 실행 루프** | Multi-turn Function Calling | LLM이 `function_call` 요청 시 백엔드 도구 자동 실행 후 결과를 수신하여 최종 자연어 응답 완료 |
 | **모바일** | 실시간 기기 상태 조회 및 자연어 가벼운 제어 | **텔레그램 봇** & Gemini 연동 (자연어로 "거실 조명 켜져있어?", "온도 몇도야?" 질의응답 및 제어) |
 | **PC 데스크톱** | 대용량 YAML 수정, 디버깅, 구문 검사, 통합 관리 | **Hermes Desktop** 앱 및 SSH 원격 연결 (`/config` 직접 마운트 및 MCP 지원) |
 | **안전 백업** | YAML 수정 전 자동 백업 및 10개 로테이션 | 타 앱 충돌 방지를 위한 `/config/hermes/backups/` 전용 경로 보관, 최신 10개 유지 |
@@ -74,10 +78,13 @@ docker run -d \
   --name hermes-agent \
   -e GEMINI_API_KEY="your-gemini-api-key" \
   -e TELEGRAM_BOT_TOKEN="your-telegram-bot-token" \
-  -p 2223:22 \
+  -p 2223:22 \   # SSH 접속용 포트 (기본 예시: 2223, 필요 시 다른 포트로 변경 가능)
   -v /usr/share/hassio/homeassistant:/config \
   ghcr.io/dicapriokim/homeassistant-hermes:latest
 ```
+
+> [!TIP]
+> 포트 번호 `2223`은 튜토리얼용 기본 예시 포트입니다. 외부 인터넷망에 노출할 경우 보안을 위해 사용자 임의의 커스텀 포트로 변경하거나 VPN(예: Tailscale, WireGuard)을 사용하는 것을 강력히 권장합니다.
 
 ---
 

@@ -18,6 +18,8 @@ authorized_keys
 ssh_host_*_key
 ssh_host_*_key.pub
 secrets.yaml
+.env
+.env.*
 .storage/
 home-assistant_v2.db*
 

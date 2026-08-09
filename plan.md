@@ -82,7 +82,7 @@
   - Proxmox LXC 컨테이너(Debian/Ubuntu, Nesting 활성화) 세팅 및 Docker 설치
   - LLM Provider를 Google AI Studio (Gemini 3.6)로 지정하고 HA Long-lived Token 연동
 * **[2단계] 백엔드(Gemini Agent) 파이썬 데몬 및 HA API 연동**
-  - `codex-cli` 제거 후 `google-generativeai` 기반 `gemini_agent.py` 구축
+  - 구형 CLI 제거 후 google-generativeai 기반 gemini_agent.py 구축
   - HA 상태 조회(`get_device_state`) 및 서비스 제어(`call_ha_service`) Tool 연동
 * **[3단계] 텔레그램 봇 모듈 개발 및 문서화**
   - 텔레그램 봇 Polling 데몬 및 Chat ID 인증 구축

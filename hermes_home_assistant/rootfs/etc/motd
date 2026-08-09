@@ -1,0 +1,6 @@
+ermes Agent for Home Assistant
+
+This shell can write all of /config and use the Home Assistant Core and
+Supervisor manager APIs. Review changes, run ha-config-check before restart,
+and never paste or commit auth tokens or SUPERVISOR_TOKEN.
+
