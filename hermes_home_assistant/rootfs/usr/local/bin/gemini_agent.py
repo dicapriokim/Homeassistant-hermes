@@ -339,27 +339,52 @@ def get_supported_models(client):
     except Exception as e:
         logger.warning(f"Could not query models.list(): {e}")
 
-    # 우선순위: 복잡한 YAML/코드 완벽 처리를 위한 Pro 모델 최우선 ➔ 3.6 Flash / 2.5 Flash 순차 폴백
+    # 우선순위: 구글에서 신규 사용자에게 폐기(404) 처리한 gemini-2.5-flash를 배제하고 활성 프로덕션 모델 사용
     preferred = [
-        'gemini-2.5-pro',        # 1순위: 최신 2.5 Pro (YAML/코드 작성 및 복잡한 추론 최상위 성능)
-        'gemini-3.6-flash',      # 2순위: 최신 3.6 Flash
-        'gemini-2.5-flash',      # 3순위: 2.5 Flash (속도 및 쿼터 한도 넉넉함)
-        'gemini-2.0-flash',      # 4순위: 2.0 Flash
-        'gemini-2.0-flash-lite', # 5순위: 2.0 Flash-Lite
-        'gemini-1.5-pro',        # 6순위: 1.5 Pro
-        'gemini-1.5-flash',      # 7순위: 1.5 Flash
+        'gemini-2.5-pro',        # 1순위: 2.5 Pro (YAML 및 고성능 추론)
+        'gemini-2.0-flash',      # 2순위: 2.0세대 Flash (표준 메인 모델)
+        'gemini-flash-latest',   # 3순위: 최신 Flash 에일리어스
+        'gemini-2.0-flash-lite', # 4순위: 2.0세대 Flash-Lite
+        'gemini-1.5-flash',      # 5순위: 1.5세대 Flash
+        'gemini-1.5-pro',        # 6순위: 1.5세대 Pro
+        'gemini-pro-latest',     # 7순위: 최신 Pro 에일리어스
     ]
     ordered = [m for m in preferred if m in supported]
     if not ordered:
-        ordered = supported if supported else ['gemini-2.5-pro', 'gemini-3.6-flash', 'gemini-2.5-flash']
+        ordered = supported if supported else ['gemini-2.0-flash', 'gemini-flash-latest', 'gemini-1.5-flash']
     return ordered
 
+def read_yaml_file(file_path: str = "/config/automations.yaml") -> str:
+    """
+    Reads the content of a Home Assistant YAML configuration file (e.g. /config/automations.yaml, /config/configuration.yaml).
+    """
+    if not file_path:
+        file_path = "/config/automations.yaml"
+    if not file_path.startswith("/config/"):
+        file_path = os.path.join("/config", file_path.lstrip("/"))
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return f"Content of {file_path}:\n```yaml\n{content}\n```"
+        else:
+            return f"File {file_path} does not exist."
+    except Exception as e:
+        return f"Error reading {file_path}: {e}"
+
 SYS_INSTRUCTION = """You are a smart home assistant powered by Gemini. You have full access to Home Assistant.
-Help the user check device states, control devices, and safely update YAML files in Korean.
+Help the user check device states, control devices, inspect YAML files, and safely update YAML files in Korean.
 
 DEVICE STATUS & QUERY RULES:
 1. When the user asks about device states, room temperatures, lights, or overall home status (e.g., "우리집 전체 온도", "거실 상태", "집안 상태"), ALWAYS invoke `get_device_state(entity_id="")` first to retrieve the real-time states of all Home Assistant entities.
 2. Search through the returned device list for relevant entity names (e.g., matching "온도", "temp", "거실", "안방", etc.) and answer concisely in Korean with the exact status/values.
+
+AUTOMATION SEARCH & REVIEW RULES:
+1. When asked to review, inspect, or optimize an automation for any device or room (e.g., "가습기 자동화 검토해줘", "공기청정기 자동화 봐줘", "작은방 자동화 검토해줘"):
+   - Step 1: Call `get_device_state("")` to fetch all entities. Filter all `automation.*` entities matching the target keyword in either `friendly_name` or `entity_id` (e.g., matching "가습기", "gaseubgi", "공기청정기", "geosil", etc.).
+   - Step 2: Call `read_yaml_file(file_path="/config/automations.yaml")` to load the YAML file.
+   - Step 3: Match the YAML automation block to the entity ID / alias resolved in Step 1, and provide a clear, helpful analysis and optimization recommendations in Korean.
+2. NEVER ask the user to provide entity IDs (e.g., `automation.geosil_gaseubgi...`) or paste YAML code. Automatically resolve entity IDs via Step 1 and Step 2!
 
 IMPORTANT RULES FOR YAML MODIFICATIONS:
 1. ALWAYS use the `backup_and_update_yaml` tool whenever editing any YAML files. Never overwrite files directly.
@@ -372,10 +397,11 @@ IMPORTANT RULES FOR YAML MODIFICATIONS:
    - **Expected Outcome (기대 효과)**
 """
 
-TOOLS_LIST = [get_device_state, call_ha_service, backup_and_update_yaml, rollback_yaml, check_ha_config]
+TOOLS_LIST = [get_device_state, call_ha_service, read_yaml_file, backup_and_update_yaml, rollback_yaml, check_ha_config]
 TOOL_MAP = {
     "get_device_state": get_device_state,
     "call_ha_service": call_ha_service,
+    "read_yaml_file": read_yaml_file,
     "backup_and_update_yaml": backup_and_update_yaml,
     "rollback_yaml": rollback_yaml,
     "check_ha_config": check_ha_config,

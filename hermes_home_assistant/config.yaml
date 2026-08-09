@@ -1,6 +1,6 @@
 ---
 name: Gemini Agent for Home Assistant
-version: "0.6.0"
+version: "0.6.1-dev"
 slug: gemini_ha_agent
 description: Gemini 3.6 API powered AI agent with Telegram bot and Hermes integration
 url: https://github.com/dicapriokim/Homeassistant-hermes

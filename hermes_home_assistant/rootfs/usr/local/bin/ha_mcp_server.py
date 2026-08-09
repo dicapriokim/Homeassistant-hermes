@@ -65,6 +65,17 @@ def handle_mcp_request(request):
                         }
                     },
                     {
+                        "name": "ha_read_yaml",
+                        "description": "Read content of a Home Assistant YAML configuration file (e.g. /config/automations.yaml, /config/configuration.yaml).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string", "description": "Path to YAML file (e.g. /config/automations.yaml, automations.yaml, configuration.yaml)"}
+                            },
+                            "required": []
+                        }
+                    },
+                    {
                         "name": "ha_rollback_yaml",
                         "description": "Restore the specified YAML file from its latest backup in /config/hermes/backups/.",
                         "inputSchema": {
@@ -90,6 +101,21 @@ def handle_mcp_request(request):
         elif tool_name == "ha_get_device_state":
             entity_id = arguments.get("entity_id")
             res = get_device_state(entity_id)
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": res}]}}
+
+        elif tool_name == "ha_read_yaml":
+            file_path = arguments.get("file_path") or "/config/automations.yaml"
+            if not file_path.startswith("/config/"):
+                file_path = os.path.join("/config", file_path.lstrip("/"))
+            try:
+                if os.path.exists(file_path):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    res = f"Content of {file_path}:\n```yaml\n{content}\n```"
+                else:
+                    res = f"File not found: {file_path}"
+            except Exception as e:
+                res = f"Error reading {file_path}: {e}"
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": res}]}}
 
         elif tool_name == "ha_rollback_yaml":
