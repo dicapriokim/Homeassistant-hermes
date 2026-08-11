@@ -1,4 +1,4 @@
-ort 22
+Port 22
 ListenAddress 0.0.0.0
 
 HostKey /data/ssh/ssh_host_ed25519_key

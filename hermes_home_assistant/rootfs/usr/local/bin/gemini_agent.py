@@ -2,11 +2,25 @@
 import warnings
 warnings.filterwarnings("ignore")
 import os
+import sys
 import json
 import glob
 import shutil
 import logging
-import requests
+import subprocess
+
+# Dynamically discover all site-packages in system
+for search_dir in ["/usr", "/opt", "/root", "/var"]:
+    for sp in glob.glob(f"{search_dir}/**/site-packages", recursive=True) + glob.glob(f"{search_dir}/**/dist-packages", recursive=True):
+        if sp not in sys.path:
+            sys.path.insert(0, sp)
+
+try:
+    import requests
+except ImportError:
+    logger.warning("requests module not found, installing via pip...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -44,7 +58,7 @@ def _read_env_file_directly() -> dict:
     for p in ["/config/.env", "/opt/Homeassistant-hermes/.env", "/usr/local/bin/.env", ".env"]:
         if os.path.isfile(p):
             try:
-                with open(p, "r", encoding="utf-8") as f:
+                with open(p, "r", encoding="utf-8-sig", errors="ignore") as f:
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith("#") and "=" in line:
@@ -85,6 +99,9 @@ SUPERVISOR_TOKEN = _clean_token(
     or _read_s6_env("SUPERVISOR_TOKEN")
     or _read_s6_env("HASS_TOKEN")
     or _read_s6_env("HA_TOKEN")
+    or _direct_env.get("SUPERVISOR_TOKEN")
+    or _direct_env.get("HASS_TOKEN")
+    or _direct_env.get("HA_TOKEN")
 )
 
 raw_url = _clean_token(
@@ -94,9 +111,11 @@ raw_url = _clean_token(
     or options.get("ha_url")
     or _read_s6_env("HASS_URL")
     or _read_s6_env("HA_URL")
+    or _direct_env.get("HASS_URL")
+    or _direct_env.get("HA_URL")
 )
-if not raw_url or "supervisor" in raw_url:
-    raw_url = "http://172.17.0.1:8123"
+if not raw_url or "supervisor" in raw_url or "172.17.0.1" in raw_url:
+    raw_url = "https://ha.dicapriokim.ddnsfree.com"
 
 HA_API_URL = raw_url
 if HA_API_URL.endswith("/"):
@@ -197,26 +216,48 @@ def rollback_yaml(file_path: str) -> str:
 
 def check_ha_config() -> str:
     """
-    Triggers a Home Assistant Core configuration check via Supervisor API.
+    Triggers a Home Assistant Core configuration check via Supervisor API or HA Core REST API.
     """
     if not SUPERVISOR_TOKEN:
-        return "Warning: SUPERVISOR_TOKEN missing, skipping core check."
+        return "Warning: SUPERVISOR_TOKEN / HASS_TOKEN missing, skipping core check."
     headers = {
         "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
         "Content-Type": "application/json",
     }
-    url = "http://supervisor/core/check"
+    
+    # 1. Supervisor API 시도 (HA OS Add-on 환경)
     try:
-        resp = requests.post(url, headers=headers, timeout=15)
+        resp = requests.post("http://supervisor/core/check", headers=headers, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             result = data.get("result", "valid")
             if result == "valid":
-                return "VALID: Home Assistant configuration check passed."
+                return "VALID: Home Assistant configuration check passed (via Supervisor API)."
             else:
                 return f"INVALID: Configuration check failed - {json.dumps(data)}"
+    except Exception as e:
+        logger.info(f"Supervisor API check skipped ({e}), falling back to HA REST API...")
+
+    # 2. HA Core REST API 폴백 (스탠드얼론 Docker / LXC 독립 환경)
+    try:
+        url = f"{HA_API_URL}/config/core/check_config"
+        resp = requests.post(url, headers=headers, timeout=10, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            result = data.get("result", "valid")
+            if result == "valid":
+                return "VALID: Home Assistant configuration check passed (via HA REST API)."
+            else:
+                errors = data.get("errors", json.dumps(data))
+                return f"INVALID: Configuration check failed - {errors}"
+        elif resp.status_code == 404:
+            service_url = f"{HA_API_URL}/services/homeassistant/check_config"
+            s_resp = requests.post(service_url, headers=headers, timeout=10, verify=False)
+            if s_resp.status_code in [200, 201]:
+                return "VALID: Home Assistant configuration check triggered (via HA Service API)."
+            return f"HTTP {resp.status_code}: Core check REST endpoint not found."
         else:
-            return f"HTTP {resp.status_code}: Core check API error."
+            return f"HTTP {resp.status_code}: Core check REST API error."
     except Exception as e:
         return f"Core check request error: {str(e)}"
 
@@ -643,8 +684,8 @@ def get_supported_models(client):
         for m in client.models.list():
             name = getattr(m, 'name', '') or ''
             name = name.replace('models/', '')
-            # pro, 3.1, 2.5 계열 (limit:0 쿼터 에러 모델) 전면 차단
-            if name.startswith('gemini') and not any(p in name for p in ["pro", "3.1", "2.5"]):
+            # 쿼터 한도(limit:0) 에러가 자주 발생하는 pro, 3.1, 2.5 계열 전면 차단 원복
+            if name.startswith('gemini') and not any(p in name for p in ["pro", "3.1", "2.5", "vision"]):
                 supported.append(name)
         logger.info(f"Available models from API: {supported}")
     except Exception as e:
@@ -652,15 +693,15 @@ def get_supported_models(client):
 
     preferred_patterns = [
         'gemini-2.0-flash-lite',
-        'gemini-flash-lite',
         'gemini-2.0-flash',
-        'gemini-flash-latest',
+        'gemini-1.5-flash-8b',
         'gemini-1.5-flash',
     ]
+    
     ordered = []
     for pref in preferred_patterns:
         for s in supported:
-            if s not in ordered and (pref in s or s.startswith(pref)):
+            if s not in ordered and (s == pref or s.startswith(f"{pref}-")):
                 ordered.append(s)
     
     # 추가로 매칭되지 않은 나머지 모델 병합
@@ -669,29 +710,162 @@ def get_supported_models(client):
             ordered.append(s)
 
     if not ordered:
-        ordered = ['gemini-2.0-flash-lite', 'gemini-2.0-flash', 'gemini-1.5-flash']
+        ordered = ['gemini-1.5-flash']
     return ordered
 
 def read_yaml_file(file_path: str = "/config/automations.yaml") -> str:
     """
-    Reads the content of a Home Assistant YAML configuration file (e.g. /config/automations.yaml, /config/configuration.yaml).
+    Reads the content of a Home Assistant YAML configuration file.
+    If local file does not exist, automatically fetches live automations from Home Assistant API.
     """
     if not file_path:
         file_path = "/config/automations.yaml"
     if not file_path.startswith("/config/"):
         file_path = os.path.join("/config", file_path.lstrip("/"))
+        
     try:
         if os.path.exists(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
             return f"Content of {file_path}:\n```yaml\n{content}\n```"
         else:
-            return f"File {file_path} does not exist."
+            # Fallback: HA REST API에서 automations.* 엔티티 실시간 수집 및 포맷팅
+            if SUPERVISOR_TOKEN and HA_API_URL:
+                headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "application/json"}
+                resp = requests.get(f"{HA_API_URL}/states", headers=headers, timeout=10, verify=False)
+                if resp.status_code == 200 and isinstance(resp.json(), list):
+                    automations = []
+                    for item in resp.json():
+                        eid = item.get("entity_id", "")
+                        if eid.startswith("automation."):
+                            name = item.get("attributes", {}).get("friendly_name", eid)
+                            st = item.get("state", "off")
+                            last_triggered = item.get("attributes", {}).get("last_triggered", "Never")
+                            automations.append(f"  • **{name}** (`{eid}`): 상태 `{st}` (최근 실행: {last_triggered})")
+                    if automations:
+                        return (
+                            f"⚠️ 로컬 `{file_path}` 파일이 존재하지 않아, Home Assistant API(`{HA_API_URL}`)를 통해 실시간 등록된 자동화 목록을 수집했습니다:\n\n"
+                            f"📜 **[Home Assistant 활성 자동화 목록 ({len(automations)}개)]**\n" + "\n".join(automations)
+                        )
+            return f"File {file_path} does not exist. (Target HA_API_URL: {HA_API_URL})"
     except Exception as e:
         return f"Error reading {file_path}: {e}"
 
+def backup_api_automation_before_change(config_id: str, action_name: str = "modification") -> str:
+    """
+    Fetches the current automation config from HA REST API and saves a timestamped JSON backup in BACKUP_DIR.
+    """
+    if not SUPERVISOR_TOKEN or not HA_API_URL or not config_id:
+        return ""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "application/json"}
+    url = f"{HA_API_URL}/config/automation/config/{config_id}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=5, verify=False)
+        data = resp.json() if resp.status_code == 200 else {}
+        if not data:
+            st_resp = requests.get(f"{HA_API_URL}/states/automation.{config_id}", headers=headers, timeout=5, verify=False)
+            data = st_resp.json() if st_resp.status_code == 200 else {"id": config_id}
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = os.path.join(BACKUP_DIR, f"api_automation_{config_id}_{timestamp}.json")
+        with open(backup_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return backup_file
+    except Exception as e:
+        logger.warning(f"Could not create API automation backup for {config_id}: {e}")
+        return ""
+
+def delete_automation_or_yaml(file_path: str = "/config/automations.yaml", start_line: int = 0, end_line: int = 0, automation_id: str = "") -> str:
+    """
+    Deletes an automation or YAML block either from a local YAML file by line range [start_line, end_line] or via Home Assistant REST API by automation_id or config ID.
+    """
+    if not file_path:
+        file_path = "/config/automations.yaml"
+    if not file_path.startswith("/config/"):
+        file_path = os.path.join("/config", file_path.lstrip("/"))
+
+    # 1. Local file line range deletion
+    if os.path.exists(file_path) and start_line > 0 and end_line >= start_line:
+        backup_result = auto_backup_yaml(file_path)
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            
+        start_idx = max(0, start_line - 1)
+        end_idx = min(len(lines), end_line)
+        before_code = "".join(lines[start_idx:end_idx]).rstrip()
+        
+        del lines[start_idx:end_idx]
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
+        log_yaml_change_history(
+            file_path=file_path,
+            root_cause="User deletion request",
+            fix_applied=f"Deleted lines {start_line}-{end_line}",
+            before_code=before_code,
+            after_code="[DELETED]",
+            start_line=start_line,
+            end_line=end_line,
+            expected_outcome="Automation block removed successfully"
+        )
+        check_result = check_ha_config()
+        return f"Success: Deleted lines {start_line}-{end_line} from {file_path} (Backup: {os.path.basename(backup_result)}).\nConfig Check: {check_result}"
+
+    # 2. HA REST API deletion by automation_id or internal config ID
+    clean_id = (automation_id or "").strip()
+    if SUPERVISOR_TOKEN and HA_API_URL and clean_id:
+        headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "application/json"}
+        
+        # Resolve internal config_id from HA state if entity_id is passed
+        config_id = clean_id.replace("automation.", "")
+        try:
+            full_eid = clean_id if clean_id.startswith("automation.") else f"automation.{clean_id}"
+            st_resp = requests.get(f"{HA_API_URL}/states/{full_eid}", headers=headers, timeout=5, verify=False)
+            if st_resp.status_code == 200:
+                attr_id = st_resp.json().get("attributes", {}).get("id")
+                if attr_id:
+                    config_id = str(attr_id)
+        except Exception:
+            pass
+
+        # Save pre-deletion JSON backup file & log history
+        backup_file = backup_api_automation_before_change(config_id, action_name="deletion")
+        before_code = f"Config ID: {config_id}"
+        if backup_file and os.path.exists(backup_file):
+            with open(backup_file, "r", encoding="utf-8") as f:
+                before_code = f.read()
+
+        url = f"{HA_API_URL}/config/automation/config/{config_id}"
+        try:
+            resp = requests.delete(url, headers=headers, timeout=10, verify=False)
+            if resp.status_code in [200, 204]:
+                requests.post(f"{HA_API_URL}/services/automation/reload", headers=headers, timeout=5, verify=False)
+                
+                log_yaml_change_history(
+                    file_path=f"REST_API_Automation_{config_id}",
+                    root_cause="User REST API deletion request",
+                    fix_applied=f"Deleted automation config_id {config_id} via REST API",
+                    before_code=before_code,
+                    after_code="[DELETED VIA REST API]",
+                    start_line=0,
+                    end_line=0,
+                    expected_outcome="Automation permanently removed via HA REST API"
+                )
+                backup_note = f" (Backup: {os.path.basename(backup_file)})" if backup_file else ""
+                return f"Success: Automation `{clean_id}` (Config ID: `{config_id}`) permanently deleted via Home Assistant REST API{backup_note}."
+            elif resp.status_code in [400, 404, 405]:
+                turn_off_res = call_ha_service("automation", "turn_off", entity_id=f"automation.{clean_id}")
+                return f"Notice: REST API deletion returned {resp.status_code}. Automation turned OFF (`automation.{clean_id}`): {turn_off_res}"
+            else:
+                return f"HTTP {resp.status_code}: Automation REST deletion failed for `{clean_id}`."
+        except Exception as e:
+            return f"API Deletion request error: {str(e)}"
+
+    return f"Error: Provide start_line and end_line for local file {file_path}, or automation_id for API deletion."
+
 SYS_INSTRUCTION = """You are a smart home assistant powered by Gemini. You have full access to Home Assistant.
-Help the user check device states, control devices, inspect YAML files, and safely update YAML files in Korean.
+Help the user check device states, control devices, inspect YAML files, safely update YAML files, and delete automations in Korean.
 
 STRICT RESPONSE QUALITY RULES (품질 3대 불변 규칙):
 1. NEVER ask the user to provide entity IDs, YAML code, or internal technical names under any circumstances! Automatically resolve entity IDs via `get_device_state("")` and `read_yaml_file("/config/automations.yaml")`.
@@ -701,34 +875,22 @@ STRICT RESPONSE QUALITY RULES (품질 3대 불변 규칙):
    - 💡 **스마트홈 환경 조성을 위한 AI 제안** (예: "에어컨을 25°C로 켤까요?")
 3. If only one temperature sensor is currently registered in HA, state clearly and politely: "현재 Home Assistant에 등록되어 수집 중인 온도 센서는 [거실 (28.53°C)] 1개입니다." instead of asking the user for entity IDs.
 
-DEVICE STATUS & QUERY RULES:
-1. When the user asks about device states, room temperatures, lights, or overall home status (e.g., "우리집 전체 온도", "거실 상태", "집안 상태"), ALWAYS invoke `get_device_state(entity_id="")` first to retrieve the real-time states of all Home Assistant entities.
-2. Search through the returned device list for relevant entity names (e.g., matching "온도", "temp", "거실", "안방", "climate", "humidifier", etc.) and answer in rich Korean Markdown format.
-
-AUTOMATION SEARCH & REVIEW RULES:
-1. When asked to review, inspect, or optimize an automation for any device or room (e.g., "가습기 자동화 검토해줘", "공기청정기 자동화 봐줘", "작은방 자동화 검토해줘"):
-   - Step 1: Call `get_device_state("")` to fetch all entities. Filter all `automation.*` entities matching the target keyword in either `friendly_name` or `entity_id`.
-   - Step 2: Call `read_yaml_file(file_path="/config/automations.yaml")` to load the YAML file.
-   - Step 3: Match the YAML automation block to the entity ID / alias resolved in Step 1, and provide a clear, helpful analysis and optimization recommendations in Korean.
-2. NEVER ask the user to provide entity IDs (e.g., `automation.geosil_gaseubgi...`) or paste YAML code. Automatically resolve entity IDs via Step 1 and Step 2!
-
-IMPORTANT RULES FOR YAML MODIFICATIONS:
-1. ALWAYS use the `backup_and_update_yaml` tool whenever editing any YAML files. Never overwrite files directly.
-2. Provide precise parameters: `file_path`, `new_content`, `start_line`, `end_line`, `root_cause`, `fix_applied`, and `expected_outcome`.
-3. Preserve existing Entity IDs and core logic structure.
-4. If a syntax check fails or user requests undo, use `rollback_yaml`.
-5. Always summarize your response to the user using the standard format:
+AUTOMATION CREATION, MODIFICATION & DELETION RULES:
+1. Whenever the user requests to edit, modify, add, or delete an automation, use `backup_and_update_yaml` for edits/additions or `delete_automation_or_yaml` for deletions.
+2. If local files are absent, use API deletion (`automation_id`) or call `call_ha_service("automation", "turn_off")`.
+3. Always summarize your response to the user using the standard format:
    - **Root Cause (원인)**
    - **Fix Applied (수정 내용)**
    - **Expected Outcome (기대 효과)**
 """
 
-TOOLS_LIST = [get_device_state, call_ha_service, read_yaml_file, backup_and_update_yaml, rollback_yaml, check_ha_config]
+TOOLS_LIST = [get_device_state, call_ha_service, read_yaml_file, backup_and_update_yaml, delete_automation_or_yaml, rollback_yaml, check_ha_config]
 TOOL_MAP = {
     "get_device_state": get_device_state,
     "call_ha_service": call_ha_service,
     "read_yaml_file": read_yaml_file,
     "backup_and_update_yaml": backup_and_update_yaml,
+    "delete_automation_or_yaml": delete_automation_or_yaml,
     "rollback_yaml": rollback_yaml,
     "check_ha_config": check_ha_config,
 }
@@ -747,24 +909,28 @@ def execute_tool_call(fn_call):
             return f"Error executing tool {name}: {e}"
     return f"Unknown tool: {name}"
 
-# 429 RESOURCE_EXHAUSTED 및 404 방지: 2.0 Flash 정식 모델 계열만 유일한 메인 후보군으로 지정
-CANDIDATE_MODELS = [
-    'gemini-2.0-flash-lite',
-    'gemini-2.0-flash'
-]
-active_model_name = 'gemini-2.0-flash-lite'
+CANDIDATE_MODELS = ['gemini-1.5-flash']
+active_model_name = 'gemini-1.5-flash'
 
 if GEMINI_API_KEY:
     masked_key = f"{GEMINI_API_KEY[:6]}...{GEMINI_API_KEY[-4:]}" if len(GEMINI_API_KEY) > 10 else "NOT_SET"
     logger.info(f"Loaded Gemini API Key: {masked_key}")
     client = genai.Client(api_key=GEMINI_API_KEY)
     
-    # .env 모델 설정 검수 (Pro 모델이 지정되어 있을 경우 2.0-flash-lite로 강제 강하)
+    # 동적으로 사용 가능한 모델 리스트 가져오기 (404 방지)
+    try:
+        CANDIDATE_MODELS = get_supported_models(client)
+    except Exception as e:
+        logger.warning(f"Failed to load dynamic models, using fallback: {e}")
+        
+    if not CANDIDATE_MODELS:
+        CANDIDATE_MODELS = ['gemini-1.5-flash']
+    
     env_model = _clean_token(options.get("gemini_model") or os.getenv("GEMINI_MODEL") or _read_s6_env("GEMINI_MODEL") or _direct_env.get("GEMINI_MODEL"))
-    if env_model and not any(p in env_model for p in ["pro", "3.1", "2.5"]):
+    if env_model in CANDIDATE_MODELS:
         active_model_name = env_model
     else:
-        active_model_name = 'gemini-2.0-flash-lite'
+        active_model_name = CANDIDATE_MODELS[0]
         
     logger.info(f"Initialized active Gemini model: {active_model_name}")
 else:
@@ -777,14 +943,20 @@ async def safe_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
     chat_id = update.effective_chat.id if update and update.effective_chat else None
     if not chat_id:
         return
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        logger.warning(f"Markdown send_message failed ({e}), falling back to plain text...")
+        
+    MAX_LEN = 4000
+    chunks = [text[i:i+MAX_LEN] for i in range(0, len(text), MAX_LEN)]
+    
+    for i, chunk in enumerate(chunks):
+        current_markup = reply_markup if i == len(chunks) - 1 else None
         try:
-            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, disable_web_page_preview=True)
-        except Exception as e2:
-            logger.error(f"Fallback plain text send_message failed: {e2}")
+            await context.bot.send_message(chat_id=chat_id, text=chunk, reply_markup=current_markup, parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as e:
+            logger.warning(f"Markdown send_message failed ({e}), falling back to plain text...")
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=chunk, reply_markup=current_markup, disable_web_page_preview=True)
+            except Exception as e2:
+                logger.error(f"Fallback plain text send_message failed: {e2}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1005,6 +1177,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             chat = chat_sessions[chat_id]
+
+            # 대화 이력 슬라이딩 윈도우: 최근 6개 메시지(3턴) 초과 시 자동 트림하여 분당 토큰 폭증 (429 RESOURCE_EXHAUSTED) 근본 방지
+            try:
+                hist = chat.get_history()
+                if len(hist) > 6:
+                    trimmed_history = hist[-6:]
+                    chat_sessions[chat_id] = client.chats.create(
+                        model=active_model_name,
+                        history=trimmed_history,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=SYS_INSTRUCTION,
+                            tools=TOOLS_LIST,
+                        )
+                    )
+                    chat = chat_sessions[chat_id]
+            except Exception as hist_err:
+                logger.warning(f"Chat history trimming notice: {hist_err}")
+
             response = chat.send_message(user_text)
 
             # 도구(Tool) 자동 실행 루프
@@ -1043,7 +1233,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ Gemini API 키가 유효하지 않습니다.\nhttps://aistudio.google.com/ 에서 새 키를 발급받아 `.env`의 `GEMINI_API_KEY`에 입력해 주세요.")
                 return
 
-            if any(k in err_str.lower() for k in ["404", "429", "quota", "rate_limit", "resource_exhausted", "exceeded", "limit", "not found"]):
+            if any(k in err_str.lower() for k in ["401", "404", "429", "quota", "rate_limit", "resource_exhausted", "exceeded", "limit", "not found", "unauthenticated", "invalid"]):
                 logger.warning(f"Model {candidate} failed ({err_str}), falling back...")
                 if chat_id in chat_sessions:
                     del chat_sessions[chat_id]
@@ -1074,9 +1264,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pinpoint_result = query_ha_raw_entities(user_text) if user_text else ""
             body_text = pinpoint_result if pinpoint_result else f"📊 **[실시간 Home Assistant 기기 상태]**\n{get_device_state('')[:1500]}"
 
+        err_detail = str(last_error) if last_error else "알 수 없는 오류"
         fallback_msg = (
-            f"⚠️ **Gemini API 일일 쿼터(Quota)가 소모되어 오프라인 응급 모드로 작동 중입니다.**\n"
-            f"*(💡 https://aistudio.google.com/ 에서 새 API 키를 발급받으시면 즉시 대화형 AI로 복구됩니다)*\n\n"
+            f"⚠️ **Gemini API 호출 오류로 오프라인 응급 모드로 작동 중입니다.**\n"
+            f"*(🔍 구글 API 에러 원인: `{err_detail[:300]}`)*\n\n"
             f"{body_text}"
         )
         await safe_reply(update, context, fallback_msg, reply_markup=reply_markup)

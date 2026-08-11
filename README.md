@@ -22,11 +22,11 @@
 
 | 기능 | 주요 역할 | 핵심 기능 및 UX |
 | :---: | :--- | :--- |
-| **최신 GenAI SDK** | Google `google-genai` v1.x 전면 이관 | 최신 Gemini 2.5 Flash / Pro 모델 연동 및 안정적인 `GenerateContentConfig` 사양 준수 |
+| **최신 GenAI SDK** | Google `google-genai` v1.x 전면 이관 | 최신 Gemini 3.6 Flash / Pro 모델 연동 및 안정적인 `GenerateContentConfig` 사양 준수 |
 | **7단계 자동 폴백** | API 쿼터 초과(429) 및 오류 방지 | 429 / 503 에러 발생 시 Primary -> Secondary -> Tertiary 등 7단계 모델 자동 스위칭 |
-| **오프라인 스마트 응급 모드** | API 및 네트워크 장애 완벽 대비 | Gemini API 장애 시 의도별 핀포인트 추출 및 오프라인 직접 기기 제어(HA Core REST API) 자동 전환 |
+| **스탠드얼론 REST API 폴백** | API 및 네트워크 장애 완벽 대비 | Gemini API 장애 시 의도별 핀포인트 추출 및 스탠드얼론 HA Core REST API 오프라인 직접 기기 제어 자동 전환 |
 | **무제한 엔티티 수집** | Smart Home 전체 기기 상태 모니터링 | `get_device_state` 개수 제한 제거로 Home Assistant 전체 상태의 실시간 조회 및 인덱싱 |
-| **도구 자동 실행 루프** | Multi-turn Function Calling | LLM이 `function_call` 요청 시 백엔드 도구 자동 실행 후 결과를 수신하여 최종 자연어 응답 완료 |
+| **도구 및 MCP 서버** | Multi-turn Function Calling & MCP | LLM Function Calling 및 자동화 수정/삭제(`ha_delete_automation`), REST API 백업 통합 MCP 서버 연동 |
 | **모바일 & 알림** | 실시간 기기 상태 조회, 음성 제어 및 깔끔한 알림 | **텔레그램 봇** 연동 (`typing...` 지표, 텔레그램 URL 미리보기 배너 차단, 인라인 버튼 UI, 음성 메시지 제어, 실시간 이상 감지 알림 엔진) |
 | **PC 데스크톱** | 대용량 YAML 수정, 디버깅, 구문 검사, 통합 관리 | **Hermes Desktop** 앱 및 SSH 원격 연결 (`/config` 직접 마운트 및 MCP 지원) |
 | **안전 백업** | YAML 수정 전 자동 백업 및 10개 로테이션 | 타 앱 충돌 방지를 위한 `/config/hermes/backups/` 전용 경로 보관, 최신 10개 유지 |
