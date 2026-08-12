@@ -38,3 +38,7 @@ changelog.md
 scratch/
 
 
+
+# Temp files
+options.json
+sshd_config
