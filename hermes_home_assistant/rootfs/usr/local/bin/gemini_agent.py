@@ -490,6 +490,31 @@ def get_ha_exposed_entity_ids() -> set:
 
     return exposed_ids
 
+def get_ha_entity_area_map() -> dict:
+    """
+    Returns a dictionary mapping entity_id -> area_name using Home Assistant Jinja2 template API.
+    Example: {'sensor.air_monitor_lite_2a53_temperature': '작은방', 'sensor.0xa4c1389a7be5dc7b_temperature': '안방'}
+    """
+    if not SUPERVISOR_TOKEN or not HA_API_URL:
+        return {}
+    headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "application/json"}
+    tmpl = "{% for s in states %}{{ s.entity_id }}|{{ area_name(s.entity_id) or '' }}\n{% endfor %}"
+    try:
+        resp = requests.post(f"{HA_API_URL}/template", headers=headers, json={"template": tmpl}, timeout=5, verify=False)
+        if resp.status_code == 200:
+            area_map = {}
+            for line in resp.text.splitlines():
+                if "|" in line:
+                    parts = line.split("|", 1)
+                    eid = parts[0].strip()
+                    aname = parts[1].strip()
+                    if aname:
+                        area_map[eid] = aname
+            return area_map
+    except Exception as e:
+        logger.warning(f"Failed to fetch entity area map: {e}")
+    return {}
+
 def format_smart_home_summary(raw_entities: list) -> str:
     total_count = len(raw_entities)
     
@@ -499,6 +524,9 @@ def format_smart_home_summary(raw_entities: list) -> str:
         filtered_exposed = [item for item in raw_entities if item.get("entity_id") in exposed_ids]
         if filtered_exposed:
             raw_entities = filtered_exposed
+
+    # HA 영역(Area) 레지스트리 맵핑 정보 사전 수집
+    area_map = get_ha_entity_area_map()
 
     # 장소별 온·습도 딕셔너리: room_name -> {'temp': float, 'hum': float}
     climate_rooms = {}
@@ -551,10 +579,14 @@ def format_smart_home_summary(raw_entities: list) -> str:
         if is_temp or is_hum:
             try:
                 val = round(float(st), 1)
-                # 장소명 정제 (예: "현관 온도" -> "현관", "안방 습도" -> "안방")
-                base_room = name.replace("온도습도계", "").replace("온도", "").replace("습도", "").replace("  ", " ").strip()
-                if not base_room:
-                    base_room = name
+                # HA 영역(Area) 등록명이 지정되어 있으면 우선 적용 (예: "작은방"), 없으면 친화적 이름 정제
+                area_name = area_map.get(eid)
+                if area_name and area_name.lower() not in ["none", "null", "로컬", "server"]:
+                    base_room = area_name
+                else:
+                    base_room = name.replace("온도습도계", "").replace("온도", "").replace("습도", "").replace("  ", " ").strip()
+                    if not base_room:
+                        base_room = name
 
                 if base_room not in climate_rooms:
                     climate_rooms[base_room] = {}
@@ -684,18 +716,19 @@ def get_supported_models(client):
         for m in client.models.list():
             name = getattr(m, 'name', '') or ''
             name = name.replace('models/', '')
-            # 쿼터 한도(limit:0) 에러가 자주 발생하는 pro, 3.1, 2.5 계열 전면 차단 원복
-            if name.startswith('gemini') and not any(p in name for p in ["pro", "3.1", "2.5", "vision"]):
+            # 쿼터 한도(limit:0 및 250k token limit) 에러가 빈번한 pro, 3.5, 3.1, 3.0, 2.5, vision, preview 계열 배제
+            if name.startswith('gemini') and not any(p in name for p in ["pro", "3.5", "3.1", "3.0", "2.5", "vision", "preview"]):
                 supported.append(name)
         logger.info(f"Available models from API: {supported}")
     except Exception as e:
         logger.warning(f"Could not query models.list(): {e}")
 
     preferred_patterns = [
+        'gemini-flash-latest',
+        'gemini-1.5-flash',
+        'gemini-1.5-flash-8b',
         'gemini-2.0-flash-lite',
         'gemini-2.0-flash',
-        'gemini-1.5-flash-8b',
-        'gemini-1.5-flash',
     ]
     
     ordered = []
@@ -704,13 +737,13 @@ def get_supported_models(client):
             if s not in ordered and (s == pref or s.startswith(f"{pref}-")):
                 ordered.append(s)
     
-    # 추가로 매칭되지 않은 나머지 모델 병합
+    # 추가로 매칭되지 않은 나머지 모델 중 배제 키워드 없는 것만 포함
     for s in supported:
         if s not in ordered:
             ordered.append(s)
 
     if not ordered:
-        ordered = ['gemini-1.5-flash']
+        ordered = ['gemini-flash-latest', 'gemini-1.5-flash']
     return ordered
 
 def read_yaml_file(file_path: str = "/config/automations.yaml") -> str:
