@@ -31,10 +31,10 @@ home-assistant_v2.db*
 /feedback/
 
 # Private development and agent knowledge files (NEVER commit)
-.agent/
-troubleshooting_history.md
-SKILL.md
-changelog.md
+/.agent/
+/troubleshooting_history.md
+/SKILL.md
+/changelog.md
 scratch/
 
 
