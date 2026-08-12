@@ -63,7 +63,7 @@ def handle_mcp_request(request):
                     },
                     {
                         "name": "ha_get_device_state",
-                        "description": "Fetch current state and attributes of a Home Assistant entity.",
+                        "description": "Fetch current state of an entity. To get a comprehensive summary of all smart home devices, pass 'all' as the entity_id.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {

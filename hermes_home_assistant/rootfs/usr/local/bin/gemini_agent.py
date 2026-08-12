@@ -534,6 +534,7 @@ def format_smart_home_summary(raw_entities: list) -> str:
     active_switches = []
     open_sensors = []
     low_batteries = []
+    off_devices = []
 
     # 불필요한 시스템 센서 및 노이즈 키워드 필터링
     noise_keywords = [
@@ -548,6 +549,10 @@ def format_smart_home_summary(raw_entities: list) -> str:
         st = str(item.get("state", "")).strip()
         attrs = item.get("attributes", {})
         name = attrs.get("friendly_name", eid)
+        _area = area_map.get(eid)
+        if _area and _area.lower() not in ["none", "null", "로컬", "server"]:
+            name = f"[{_area}] {name}"
+            
         unit = str(attrs.get("unit_of_measurement", "")).strip()
         device_class = str(attrs.get("device_class", "")).strip()
 
@@ -579,10 +584,9 @@ def format_smart_home_summary(raw_entities: list) -> str:
         if is_temp or is_hum:
             try:
                 val = round(float(st), 1)
-                # HA 영역(Area) 등록명이 지정되어 있으면 우선 적용 (예: "작은방"), 없으면 친화적 이름 정제
-                area_name = area_map.get(eid)
-                if area_name and area_name.lower() not in ["none", "null", "로컬", "server"]:
-                    base_room = area_name
+                # 이름에 이미 [영역]이 포함되어 있으면 그대로 사용
+                if name.startswith("[") and "] " in name:
+                    base_room = name.split("] ", 1)[0][1:]
                 else:
                     base_room = name.replace("온도습도계", "").replace("온도", "").replace("습도", "").replace("  ", " ").strip()
                     if not base_room:
@@ -599,13 +603,19 @@ def format_smart_home_summary(raw_entities: list) -> str:
                 pass
             continue
 
-        # 2. 켜진 조명
-        elif eid_lower.startswith("light.") and st == "on":
-            active_lights.append(name)
+        # 2. 조명
+        elif eid_lower.startswith("light."):
+            if st == "on":
+                active_lights.append(name)
+            else:
+                off_devices.append(name)
 
-        # 3. 켜진 스위치/가전
-        elif eid_lower.startswith("switch.") and st == "on":
-            active_switches.append(name)
+        # 3. 스위치/가전
+        elif eid_lower.startswith("switch."):
+            if st == "on":
+                active_switches.append(name)
+            else:
+                off_devices.append(name)
 
         # 4. 열린 창문/문 및 재실 감지
         elif eid_lower.startswith("binary_sensor.") and st in ["on", "open"]:
@@ -645,6 +655,10 @@ def format_smart_home_summary(raw_entities: list) -> str:
     if low_batteries:
         lines.append(f"🪫 **배터리 교체 필요 ({len(low_batteries)}개)**:")
         lines.append(f"  • {', '.join(low_batteries)}")
+        lines.append("")
+
+    if off_devices:
+        lines.append(f"💤 **꺼진 기기 ({len(off_devices)}개)**: " + ", ".join(off_devices[:15]))
         lines.append("")
 
     if len(lines) == 1:
