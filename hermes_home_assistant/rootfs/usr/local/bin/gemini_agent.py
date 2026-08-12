@@ -535,6 +535,7 @@ def format_smart_home_summary(raw_entities: list) -> str:
     open_sensors = []
     low_batteries = []
     off_devices = []
+    unavailable_devices = []
 
     # 불필요한 시스템 센서 및 노이즈 키워드 필터링
     noise_keywords = [
@@ -560,6 +561,7 @@ def format_smart_home_summary(raw_entities: list) -> str:
         name_lower = name.lower()
 
         if st in ["unavailable", "unknown"]:
+            unavailable_devices.append(name)
             continue
             
         # 배터리 전용 센서는 온/습도 계산에서 즉시 제외하여 하단으로 분리
@@ -659,6 +661,10 @@ def format_smart_home_summary(raw_entities: list) -> str:
 
     if off_devices:
         lines.append(f"💤 **꺼진 기기 ({len(off_devices)}개)**: " + ", ".join(off_devices[:15]))
+        lines.append("")
+
+    if unavailable_devices:
+        lines.append(f"⚠️ **연결 끊김/사용 불가 ({len(unavailable_devices)}개)**: " + ", ".join(unavailable_devices[:15]))
         lines.append("")
 
     if len(lines) == 1:
